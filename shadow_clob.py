@@ -120,7 +120,7 @@ class ShadowCLOB:
             return None
         return {"price": lp, "side": ls}
 
-    def adaptive_buy(self, token_id: str, limit_price: float, shares: float, condition: str):
+    def adaptive_buy(self, token_id: str, limit_price: float, shares: float, condition: str, *, allocation_budget: Optional[float] = None, book_snapshot: Optional[dict] = None):
         """Simulate an immediate marketable FAK BUY from current visible asks.
 
         ``limit_price`` is retained for API compatibility but is not used as a
@@ -132,10 +132,12 @@ class ShadowCLOB:
         requested = float(shares)
         if requested <= 0:
             raise ValueError("shadow adaptive order has non-positive requested shares")
-        allocation_budget = requested * float(limit_price)
+        if allocation_budget is None:
+            allocation_budget = requested * float(limit_price)
+        allocation_budget = float(allocation_budget)
         if allocation_budget <= 0:
             raise ValueError("shadow adaptive order has invalid allocation budget")
-        d = self.book_details(token_id)
+        d = dict(book_snapshot) if isinstance(book_snapshot, dict) else self.book_details(token_id)
         asks = []
         for row in d.get("asks") or []:
             if not isinstance(row, dict):
