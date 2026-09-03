@@ -309,6 +309,9 @@ class LiveLedger:
                     "fee_rate_bps": str(trade.get("fee_rate_bps") or trade.get("feeRateBps") or "0"),
                     "status": "FILLED",
                     "transaction_hash": trade.get("transaction_hash") or trade.get("transactionHash", ""),
+                    "shadow": bool(trade.get("shadow") or order.get("shadow_execution")),
+                    "adaptive": bool(trade.get("adaptive")),
+                    "execution_mode": order.get("execution_mode", trade.get("execution_mode", "")),
                     **{k: order[k] for k in (
                         "slug", "asset", "market_id", "start_ts", "end_ts",
                         "regime", "fine_band", "entry_count_before", "burst_position",
