@@ -1,5 +1,6 @@
 import logging
 import os
+import re
 import shutil
 import time
 import traceback
@@ -153,13 +154,16 @@ def restore_strategy_distribution_from_ledger():
 
 restore_strategy_distribution_from_ledger()
 
-# Paper mode intentionally runs TWO ledgers in parallel from the exact same
-# strategy signals:
-#   1) `ledger`: the legacy instant-fill benchmark (signal == fill).
-#   2) `realistic_ledger`: only actual simulated resting-order fills enter it.
-# The benchmark is retained so the realism gap is measurable rather than hidden.
+# Execution-mode paper/shadow runs use the live visible-ask path as the primary
+# execution-realism ledger. Pure PAPER mode keeps the separate resting-maker
+# simulator as a diagnostic benchmark. This prevents the two execution models
+# from being mixed or double-booked.
 realistic_fill_enabled = PAPER and os.getenv("REALISTIC_FILL_SIM", "true").lower() in ("1", "true", "yes", "on")
-if realistic_fill_enabled:
+if realistic_fill_enabled and EXECUTION_MODE:
+    realistic_ledger = PaperLedger(DATA / "realistic_execution_state.json", strategy.bankroll)
+    realistic_feed = None
+    realistic_simulator = None
+elif realistic_fill_enabled:
     realistic_ledger = PaperLedger(DATA / "realistic_fill_state.json", strategy.bankroll)
     realistic_feed = PolymarketMarketFeed(
         url=os.getenv("MARKET_WS_URL", "wss://ws-subscriptions-clob.polymarket.com/ws/market"),
@@ -198,6 +202,8 @@ consecutive_errors = 0
 next_trade_at = 0.0
 scan_offset = 0
 current_target_band = None
+last_halt_log = 0.0
+_halt_logged_reason = None
 adaptive_planner = CLOBAdaptivePlanner(
     max_order=float(os.getenv("MAX_SINGLE_ORDER", "5")),
     batch_window_seconds=float(os.getenv("ADAPTIVE_BATCH_WINDOW_SECONDS", "6")),
@@ -345,6 +351,33 @@ def resolve_pending(now):
             )
 
 
+def _execution_realistic_metrics(now: float):
+    """Build research metrics for immediate-ask shadow executions."""
+    trades = [t for t in getattr(realistic_ledger, "trades", []) if t.get("action") == "BUY"] if realistic_ledger is not None else []
+    by_regime = {}
+    by_band = {}
+    for t in trades:
+        regime = str(t.get("regime") or "UNKNOWN")
+        band = str(t.get("fine_band") or "UNKNOWN")
+        for bucket, key in ((by_regime, regime), (by_band, band)):
+            b = bucket.setdefault(key, {"signals":0,"filled":0,"any_filled":0,"partial":0,"expired":0,"fill_rate":0.0,"any_fill_rate":0.0,"expire_rate":0.0,"signal_notional":0.0,"fill_cost":0.0,"filled_notional":0.0,"latencies":[]})
+            b["signals"] += 1
+            b["filled"] += 1 if float(t.get("shares", 0.0)) > 0 else 0
+            b["any_filled"] += 1 if float(t.get("shares", 0.0)) > 0 else 0
+            b["signal_notional"] += float(t.get("requested_budget", t.get("notional", 0.0)))
+            b["fill_cost"] += float(t.get("notional", 0.0))
+            b["filled_notional"] += float(t.get("notional", 0.0))
+    for bucket in (by_regime, by_band):
+        for b in bucket.values():
+            b["fill_rate"] = 1.0 if b["signals"] else 0.0
+            b["any_fill_rate"] = b["fill_rate"]
+            b["expire_rate"] = 0.0
+    n = len(trades)
+    total = sum(float(t.get("notional", 0.0)) for t in trades)
+    return {"orders": n, "filled": n, "partial": 0, "pending": 0, "expired_unfilled": 0,
+            "signal_notional": total, "filled_notional": total, "by_regime": by_regime, "by_band": by_band,
+            "now": now}
+
 def report(books):
     global last_report
 
@@ -368,23 +401,28 @@ def report(books):
     )
     if realistic_ledger is not None:
         rmetrics = realistic_ledger.mark(books)
-        sim = realistic_simulator.metrics(now)
+        if realistic_simulator is not None:
+            sim = realistic_simulator.metrics(now)
+            label = "PAPER RESTING REALISM"
+        else:
+            sim = _execution_realistic_metrics(now)
+            label = "PAPER EXECUTION REALISM"
         research.record_realistic_metrics(now, rmetrics, sim, instant_metrics=metrics)
         p(
-            f"PAPER REALISTIC | pnl=${rmetrics['pnl']:+.2f} | realized=${rmetrics['realized']:+.2f} "
+            f"{label} | pnl=${rmetrics['pnl']:+.2f} | realized=${rmetrics['realized']:+.2f} "
             f"| unrealized=${rmetrics['unrealized']:+.2f} | cash=${rmetrics['cash']:.2f} "
             f"| open=${rmetrics['open_cost']:.2f} | positions={len(realistic_ledger.positions)} "
             f"| signals={sim['orders']} | filled={sim['filled']} | partial={sim['partial']} "
             f"| pending={sim['pending']} | expired={sim['expired_unfilled']} "
             f"| fill_rate={sim['filled']/sim['orders']:.2%}" if sim['orders'] else
-            f"PAPER REALISTIC | pnl=${rmetrics['pnl']:+.2f} | realized=${rmetrics['realized']:+.2f} "
+            f"{label} | pnl=${rmetrics['pnl']:+.2f} | realized=${rmetrics['realized']:+.2f} "
             f"| unrealized=${rmetrics['unrealized']:+.2f} | cash=${rmetrics['cash']:.2f} "
             f"| open=${rmetrics['open_cost']:.2f} | positions={len(realistic_ledger.positions)} | signals=0 | filled=0 | pending=0 | expired=0 | fill_rate=0.00%"
         )
 
 
 def main():
-    global last_disc, last_maintenance, last_heartbeat, consecutive_errors, next_trade_at, scan_offset, current_target_band
+    global last_disc, last_maintenance, last_heartbeat, consecutive_errors, next_trade_at, scan_offset, current_target_band, last_halt_log, _halt_logged_reason
 
     startup_data_check()
     if realistic_simulator is not None:
@@ -464,6 +502,24 @@ def main():
         try:
             now = time.time()
 
+            # A daily-loss/corrupt-state risk halt is terminal for this process.
+            # Never throw it through the outer loop: that creates an endless
+            # traceback/restart loop while no new trading decision can be made.
+            if EXECUTION_MODE and risk.halted:
+                if _halt_logged_reason != risk.halt_reason or now - last_halt_log >= 300:
+                    p(f"RISK HALTED | reason={risk.halt_reason} | trading=DISABLED")
+                    _halt_logged_reason = risk.halt_reason
+                    last_halt_log = now
+                try:
+                    live.cancel_all()
+                except Exception as exc:
+                    if _halt_logged_reason != f"{risk.halt_reason}|cancel_error" or now - last_halt_log >= 300:
+                        p(f"RISK HALT CANCEL WARNING | reason={type(exc).__name__}: {exc}")
+                        _halt_logged_reason = f"{risk.halt_reason}|cancel_error"
+                        last_halt_log = now
+                time.sleep(max(2.0, float(os.getenv("HALT_SLEEP_SECONDS", "30"))))
+                continue
+
             if realistic_simulator is not None:
                 for expired_order in realistic_simulator.expire(now):
                     research.record_realistic_unfilled(expired_order, "EXPIRED_UNFILLED")
@@ -532,11 +588,35 @@ def main():
                     fills = ledger.sync_trades(live.get_trades())
                     risk.sync_realized(ledger.realized)
                     if risk.halted:
-                        try:
-                            live.cancel_all()
-                        finally:
-                            raise RuntimeError(f"LIVE RISK HALT: {risk.halt_reason}")
+                        # Leave the current loop through the terminal-halt guard
+                        # on the next iteration. Do not manufacture an exception.
+                        continue
                     for fill in fills:
+                        if realistic_ledger is not None and SHADOW and fill.get("shadow"):
+                            existing_ids = {str(t.get("trade_id")) for t in realistic_ledger.trades if t.get("trade_id")}
+                            if str(fill.get("trade_id")) not in existing_ids:
+                                rmeta = {
+                                    "realistic_fill": True,
+                                    "fill_source": "SHADOW_CLOB_VISIBLE_ASK",
+                                    "execution_mode": fill.get("execution_mode", "CLOB_IMMEDIATE_ASK_FAK"),
+                                    "order_id": fill.get("order_id"),
+                                    "trade_id": fill.get("trade_id"),
+                                }
+                                for k in ("slug","asset","market_id","start_ts","end_ts","regime","fine_band","target_capital","trajectory_likelihood","entry_count_before","burst_position","seconds_since_previous_trade","signal_key","execution_mode","requested_budget","max_execution_price"):
+                                    if k in fill:
+                                        rmeta[k] = fill[k]
+                                # Shadow fills are already authoritative for this
+                                # paper execution path. Keep the original V15.2
+                                # signal band/notional in metadata rather than
+                                # reclassifying on the fill price.
+                                rmeta["execution_price"] = float(fill.get("price"))
+                                rmeta["filled_cost"] = float(fill.get("notional", 0.0))
+                                rmeta["filled_shares"] = float(fill.get("shares", 0.0))
+                                realistic_ledger.buy(
+                                    condition=fill["condition"], token=fill["token"], market=fill.get("market", ""),
+                                    side=fill.get("side", ""), price=float(fill["price"]), notional=float(fill["notional"]),
+                                    ts=float(fill.get("ts", now)), meta=rmeta,
+                                )
                         fill_market = markets.get(fill.get("condition"))
                         if fill_market:
                             fill_elapsed = max(0.0, now - float(fill_market["start_ts"]))
@@ -788,6 +868,21 @@ def main():
 
                 band, regime = strategy.fine_band(signal.price)
 
+                # V15.2 target-band identity is a behavioral invariant. The
+                # strategy module is kept byte-for-byte identical to the verified
+                # reference, so enforce its advertised target here instead of
+                # silently accepting a candidate from another band.
+                target_match = re.search(r"target_band=([A-Z0-9_]+)", str(signal.reason or ""))
+                advertised_target_band = target_match.group(1) if target_match else None
+                if advertised_target_band and band != advertised_target_band:
+                    p(
+                        f"TRADE SIGNAL REJECTED | V15.2 BAND MISMATCH | asset={market['asset']} "
+                        f"| side={signal.side} | target_band={advertised_target_band} | actual_band={band} "
+                        f"| bid=${signal.price:.4f} | reason=TARGET_BAND_NOT_AVAILABLE"
+                    )
+                    current_target_band = None
+                    continue
+
                 meta = {
                     "slug": market["slug"],
                     "asset": market["asset"],
@@ -873,17 +968,29 @@ def main():
                         raise RuntimeError(f"LIVE ORDER STATE ERROR | {type(exc).__name__}: {exc}") from exc
 
                     try:
-                        current_ask = up_ask if token == market["up"] else down_ask
+                        shadow_book_snapshot = None
+                        if SHADOW:
+                            shadow_book_snapshot = live.book_details(token)
+                            current_ask = shadow_book_snapshot.get("best_ask")
+                            min_shares = float(shadow_book_snapshot.get("min_order_size") or 0.0)
+                            tick = float(shadow_book_snapshot.get("tick_size") or 0.01)
+                            min_cost = float(current_ask) * min_shares if current_ask is not None else 0.0
+                        else:
+                            current_ask = up_ask if token == market["up"] else down_ask
+                            if current_ask is None:
+                                p(f"CLOB IMMEDIATE ASK WAIT | asset={market['asset']} | side={signal.side} "
+                                  f"| signal=${notion:.4f} | bid=${signal.price:.4f} | ask=None "
+                                  f"| reason=NO_CURRENT_ASK")
+                                continue
+                            min_cost, min_shares = live.minimum_order(token, market["condition"], current_ask)
+                            try:
+                                tick = float(live.tick_size(token))
+                            except Exception:
+                                tick = float(os.getenv("DEFAULT_TICK_SIZE", "0.01"))
                         if current_ask is None:
-                            p(f"CLOB IMMEDIATE ASK WAIT | asset={market['asset']} | side={signal.side} "
-                              f"| signal=${notion:.4f} | bid=${signal.price:.4f} | ask=None "
-                              f"| reason=NO_CURRENT_ASK")
+                            p(f"CLOB IMMEDIATE ASK WAIT | asset={market['asset']} | side={signal.side} | signal=${notion:.4f} "
+                              f"| bid=${signal.price:.4f} | ask=None | reason=NO_CURRENT_ASK")
                             continue
-                        min_cost, min_shares = live.minimum_order(token, market["condition"], current_ask)
-                        try:
-                            tick = float(live.tick_size(token))
-                        except Exception:
-                            tick = float(os.getenv("DEFAULT_TICK_SIZE", "0.01"))
                         # Ask is the actual execution reference; only proceed when
                         # this current ask is accepted by at least one queued signal.
                         group_items = [x for x in execution_queue.pending()
@@ -949,9 +1056,15 @@ def main():
                             p(f"CLOB IMMEDIATE ASK RISK BLOCK | {why} | asset={market['asset']}")
                             continue
 
-                        response = live.adaptive_buy(
-                            token, plan.execution_price, plan.order_shares, market["condition"]
-                        )
+                        if SHADOW:
+                            response = live.adaptive_buy(
+                                token, plan.execution_price, plan.order_shares, market["condition"],
+                                allocation_budget=plan.requested_budget, book_snapshot=shadow_book_snapshot,
+                            )
+                        else:
+                            response = live.adaptive_buy(
+                                token, plan.execution_price, plan.order_shares, market["condition"]
+                            )
                         order_id = str(response.get("orderID") or response.get("orderId") or response.get("id") or "")
                         if not order_id:
                             raise RuntimeError(f"CLOB adaptive accepted call without order id: {response!r}")
